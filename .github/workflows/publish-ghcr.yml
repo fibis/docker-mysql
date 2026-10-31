@@ -1,0 +1,125 @@
+---
+
+# Build, test and publish every image of a branch to ghcr.io/<owner>/mysql,
+# as multi-arch tags named like upstream: <name>-<version>[-<release>]
+name: 📦 Publish to GHCR
+
+on:
+  push:
+    branches:
+      - ghcr-publish
+    paths:
+      - '.github/workflows/publish-ghcr.yml'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or tag with the Dockerfiles to publish'
+        required: true
+      release:
+        description: 'Release suffix for the versioned tags, e.g. 0.23'
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # Defaults for the push trigger
+  REF: ${{ inputs.ref || 'update-versions' }}
+  RELEASE: ${{ inputs.release || '0.23' }}
+  ORG_USER: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  matrix:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.matrix.outputs.build }}
+      images: ${{ steps.matrix.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+
+      - name: Read the version matrix from params.yml
+        id: matrix
+        run: |
+          set -eu
+          M="$( yq -r '.env.MATRIX' .github/workflows/params.yml | jq -c . )"
+          echo "build=$( jq -c '[.[] | .NAME as $n | .VERSION[] as $v | .ARCH[] as $a | {name: $n, version: $v, arch: $a}]' <<< "${M}" )" >> "${GITHUB_OUTPUT}"
+          echo "images=$( jq -c '[.[] | .NAME as $n | .ARCH as $a | .VERSION[] | {name: $n, version: ., arches: ($a | map(sub("linux/"; "")) | join(" "))}]' <<< "${M}" )" >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: [matrix]
+    name: ${{ matrix.name }}-${{ matrix.version }} (${{ matrix.arch }})
+    runs-on: ${{ startsWith(matrix.arch, 'linux/arm') && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      # GHCR allows 2000 requests/minute
+      max-parallel: 6
+      matrix:
+        include: ${{ fromJson(needs.matrix.outputs.build) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build, test and push
+        env:
+          NAME: ${{ matrix.name }}
+          VERSION: ${{ matrix.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "Retry ${i}/5: $*"; sleep $(( i * 30 )); done; return 1; }
+          make build NAME="${NAME}" VERSION="${VERSION}" ARCH="${ARCH}" ORG_USER="${ORG_USER}"
+          make test  NAME="${NAME}" VERSION="${VERSION}" ARCH="${ARCH}" ORG_USER="${ORG_USER}"
+          DST="${ORG_USER}/mysql:${NAME}-${VERSION}-${RELEASE}-${ARCH/\//-}"
+          docker tag "${ORG_USER}/mysql:${NAME}-${VERSION}" "${DST}"
+          retry docker push "${DST}"
+
+  manifest:
+    needs: [matrix, build]
+    # One failed image must not keep the others from being published
+    if: ${{ !cancelled() }}
+    name: ${{ matrix.name }}-${{ matrix.version }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include: ${{ fromJson(needs.matrix.outputs.images) }}
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Create multi-arch tags
+        env:
+          NAME: ${{ matrix.name }}
+          VERSION: ${{ matrix.version }}
+          ARCHES: ${{ matrix.arches }}
+        run: |
+          set -eu
+          retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "Retry ${i}/5: $*"; sleep $(( i * 30 )); done; return 1; }
+          TAG="${ORG_USER}/mysql:${NAME}-${VERSION}"
+          REFS=""
+          for ARCH in ${ARCHES}; do
+            REFS="${REFS} ${TAG}-${RELEASE}-linux-${ARCH}"
+          done
+          retry docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --annotation "index:org.opencontainers.image.description=${NAME} ${VERSION} for devilbox" \
+            --tag "${TAG}-${RELEASE}" \
+            --tag "${TAG}" \
+            ${REFS}
+          docker buildx imagetools inspect "${TAG}-${RELEASE}"
